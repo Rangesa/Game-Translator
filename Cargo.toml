@@ -1,0 +1,36 @@
+[package]
+name = "game_translator"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time game screen translator using Windows OCR and overlay display"
+license = "MIT"
+repository = "https://github.com/Rangesa/game-translator"
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Win32_System_WinRT",
+    "Win32_UI_HiDpi",
+    "Win32_Storage_Xps",
+] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+futures = "0.3"
+eframe = "0.31"
+toml = "0.8"

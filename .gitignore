@@ -1,0 +1,9 @@
+/target
+/target2
+.env
+config.toml
+translation_cache.json
+*.exe
+*.zip
+exported_src_txt/
+game_translator_all_src.txt

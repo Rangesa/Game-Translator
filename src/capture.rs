@@ -6,11 +6,15 @@ use windows::Win32::Storage::Xps::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::BOOL;
 
-/// 対象ウィンドウのPrintWindowキャプチャ
+/// 対象ウィンドウのPrintWindowキャプチャ（DIB永続化版）
 pub struct WindowCapture {
     target_hwnd: HWND,
     width: u32,
     height: u32,
+    memory_dc: HDC,
+    bitmap: HBITMAP,
+    old_bitmap: HGDIOBJ,
+    bits: *mut u8,
 }
 
 impl WindowCapture {
@@ -19,33 +23,30 @@ impl WindowCapture {
             target_hwnd,
             width: 0,
             height: 0,
+            memory_dc: HDC::default(),
+            bitmap: HBITMAP::default(),
+            old_bitmap: HGDIOBJ::default(),
+            bits: std::ptr::null_mut(),
         })
     }
 
-    pub fn capture_frame(&mut self) -> Result<Option<Vec<u8>>> {
+    /// (Re)create the DIB section and memory DC for the given dimensions.
+    fn ensure_dib(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.width == width && self.height == height && !self.memory_dc.is_invalid() {
+            return Ok(());
+        }
+
+        // Free previous resources
+        self.free_dib();
+
         unsafe {
-            // 対象ウィンドウのクライアント領域サイズを取得
-            let mut rect = RECT::default();
-            GetClientRect(self.target_hwnd, &mut rect)?;
-
-            let width = (rect.right - rect.left) as u32;
-            let height = (rect.bottom - rect.top) as u32;
-
-            if width == 0 || height == 0 {
-                return Ok(None);
-            }
-
-            self.width = width;
-            self.height = height;
-
-            // メモリDCとビットマップを作成
             let window_dc = GetDC(Some(self.target_hwnd));
             if window_dc.is_invalid() {
                 anyhow::bail!("GetDC failed for target window");
             }
             let memory_dc = CreateCompatibleDC(Some(window_dc));
+            ReleaseDC(Some(self.target_hwnd), window_dc);
             if memory_dc.is_invalid() {
-                ReleaseDC(Some(self.target_hwnd), window_dc);
                 anyhow::bail!("CreateCompatibleDC failed");
             }
 
@@ -62,36 +63,75 @@ impl WindowCapture {
                 ..Default::default()
             };
 
-            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut bits_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
             let bitmap = CreateDIBSection(
                 Some(memory_dc),
                 &bmi,
                 DIB_RGB_COLORS,
-                &mut bits,
+                &mut bits_ptr,
                 None,
                 0,
             )?;
 
             let old_bitmap = SelectObject(memory_dc, HGDIOBJ(bitmap.0));
 
-            // PrintWindowでウィンドウ内容をキャプチャ（DXゲーム対応）
-            let pw_result = PrintWindow(self.target_hwnd, memory_dc, PRINT_WINDOW_FLAGS(2)); // PW_RENDERFULLCONTENT = 2
+            self.memory_dc = memory_dc;
+            self.bitmap = bitmap;
+            self.old_bitmap = old_bitmap;
+            self.bits = bits_ptr as *mut u8;
+            self.width = width;
+            self.height = height;
+        }
 
-            if !pw_result.as_bool() {
+        Ok(())
+    }
+
+    fn free_dib(&mut self) {
+        unsafe {
+            if !self.memory_dc.is_invalid() {
+                SelectObject(self.memory_dc, self.old_bitmap);
+                let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+                let _ = DeleteDC(self.memory_dc);
+                self.memory_dc = HDC::default();
+                self.bitmap = HBITMAP::default();
+                self.old_bitmap = HGDIOBJ::default();
+                self.bits = std::ptr::null_mut();
+            }
+        }
+    }
+
+    pub fn capture_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        unsafe {
+            // 対象ウィンドウのクライアント領域サイズを取得
+            let mut rect = RECT::default();
+            GetClientRect(self.target_hwnd, &mut rect)?;
+
+            let width = (rect.right - rect.left) as u32;
+            let height = (rect.bottom - rect.top) as u32;
+
+            if width == 0 || height == 0 {
+                return Ok(None);
+            }
+
+            // Recreate DIB only when dimensions change
+            self.ensure_dib(width, height)?;
+
+            // PrintWindowでウィンドウ内容をキャプチャ（DXゲーム対応）
+            let window_dc = GetDC(Some(self.target_hwnd));
+            let pw_result = PrintWindow(self.target_hwnd, self.memory_dc, PRINT_WINDOW_FLAGS(2)); // PW_RENDERFULLCONTENT = 2
+
+            if !pw_result.as_bool() && !window_dc.is_invalid() {
                 // PrintWindow失敗時はBitBltにフォールバック
-                let _ = BitBlt(memory_dc, 0, 0, width as i32, height as i32, Some(window_dc), 0, 0, SRCCOPY);
+                let _ = BitBlt(self.memory_dc, 0, 0, width as i32, height as i32, Some(window_dc), 0, 0, SRCCOPY);
+            }
+            if !window_dc.is_invalid() {
+                ReleaseDC(Some(self.target_hwnd), window_dc);
             }
 
             // ピクセルデータをコピー
             let data_size = (width * height * 4) as usize;
             let mut pixel_data = vec![0u8; data_size];
-            std::ptr::copy_nonoverlapping(bits as *const u8, pixel_data.as_mut_ptr(), data_size);
-
-            // クリーンアップ
-            SelectObject(memory_dc, old_bitmap);
-            let _ = DeleteObject(HGDIOBJ(bitmap.0));
-            let _ = DeleteDC(memory_dc);
-            ReleaseDC(Some(self.target_hwnd), window_dc);
+            std::ptr::copy_nonoverlapping(self.bits, pixel_data.as_mut_ptr(), data_size);
 
             Ok(Some(pixel_data))
         }
@@ -114,6 +154,12 @@ impl WindowCapture {
                 (0, 0)
             }
         }
+    }
+}
+
+impl Drop for WindowCapture {
+    fn drop(&mut self) {
+        self.free_dib();
     }
 }
 

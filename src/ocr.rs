@@ -45,12 +45,12 @@ impl OCREngine {
             let tag = lang.LanguageTag()
                 .map_err(|e| anyhow::anyhow!("Failed to get language tag: {:?}", e))?;
 
-            println!("  Available OCR language: {}", tag);
+            crate::log_always(&format!("Available OCR language: {}", tag));
 
             if tag.to_string().to_lowercase().starts_with("en") {
                 engine_opt = OcrEngine::TryCreateFromLanguage(&lang).ok();
                 if engine_opt.is_some() {
-                    println!("  Using English OCR");
+                    crate::log_always("Using English OCR");
                     break;
                 }
             }
@@ -59,7 +59,7 @@ impl OCREngine {
         if engine_opt.is_none() {
             let lang = available_languages.GetAt(0)?;
             let tag = lang.LanguageTag()?;
-            println!("  English not found, using: {}", tag);
+            crate::log_always(&format!("English not found, using: {}", tag));
             engine_opt = OcrEngine::TryCreateFromLanguage(&lang).ok();
         }
 

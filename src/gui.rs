@@ -1,17 +1,19 @@
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::capture::list_windows;
 use crate::config::{AppConfig, TranslationEngine};
 use crate::overlay::OverlayConfig;
+use crate::translate::Translator;
 
 /// Status message displayed in the GUI
 #[derive(Clone)]
 enum AppStatus {
     Idle,
     Running,
+    Stopping,
     Error(String),
 }
 
@@ -27,6 +29,10 @@ pub struct GameTranslatorApp {
     overlay_thread: Option<JoinHandle<()>>,
     /// Overlay HWND for sending WM_DESTROY
     overlay_hwnd_raw: Arc<std::sync::atomic::AtomicIsize>,
+    /// API test result (None = not tested / in progress, Some = result message)
+    api_test_result: Arc<Mutex<Option<String>>>,
+    api_testing: Arc<AtomicBool>,
+    debug_log: bool,
 }
 
 impl GameTranslatorApp {
@@ -60,6 +66,9 @@ impl GameTranslatorApp {
             stop_signal: Arc::new(AtomicBool::new(false)),
             overlay_thread: None,
             overlay_hwnd_raw: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
+            api_test_result: Arc::new(Mutex::new(None)),
+            api_testing: Arc::new(AtomicBool::new(false)),
+            debug_log: false,
         };
         app.refresh_windows();
         app
@@ -85,6 +94,12 @@ impl GameTranslatorApp {
                     return;
                 }
             }
+            TranslationEngine::Groq => {
+                if self.config.groq_api_key.trim().is_empty() {
+                    self.status = AppStatus::Error("Groq APIキーが未設定です".to_string());
+                    return;
+                }
+            }
         }
 
         let target_hwnd_raw = match self.selected_window_index {
@@ -97,7 +112,7 @@ impl GameTranslatorApp {
 
         // Save config
         if let Err(e) = self.config.save() {
-            eprintln!("Failed to save config: {}", e);
+            crate::log_always(&format!("Failed to save config: {}", e));
         }
 
         // Reset stop signal
@@ -120,7 +135,7 @@ impl GameTranslatorApp {
                 stop_signal,
                 overlay_hwnd_arc,
             ) {
-                eprintln!("Overlay thread error: {}", e);
+                crate::log_always(&format!("Overlay thread error: {}", e));
             }
         });
 
@@ -131,33 +146,95 @@ impl GameTranslatorApp {
     fn stop(&mut self) {
         self.stop_signal.store(true, Ordering::SeqCst);
 
-        // Send WM_DESTROY to overlay window to break the message loop
+        // Send WM_CLOSE to overlay window to break the message loop
         let hwnd_raw = self.overlay_hwnd_raw.load(Ordering::SeqCst);
         if hwnd_raw != 0 {
             unsafe {
                 use windows::Win32::Foundation::*;
                 use windows::Win32::UI::WindowsAndMessaging::*;
                 let hwnd = HWND(hwnd_raw as *mut _);
-                let _ = PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
 
-        // Wait for overlay thread to finish
-        if let Some(handle) = self.overlay_thread.take() {
-            let _ = handle.join();
-        }
+        self.status = AppStatus::Stopping;
+    }
 
-        self.overlay_hwnd_raw.store(0, Ordering::SeqCst);
-        self.status = AppStatus::Idle;
+    /// Check if the overlay thread has finished and clean up.
+    fn poll_thread_completion(&mut self) {
+        if let Some(handle) = &self.overlay_thread {
+            if handle.is_finished() {
+                if let Some(handle) = self.overlay_thread.take() {
+                    let _ = handle.join();
+                }
+                self.overlay_hwnd_raw.store(0, Ordering::SeqCst);
+                self.status = AppStatus::Idle;
+            }
+        }
     }
 
     fn is_running(&self) -> bool {
-        matches!(self.status, AppStatus::Running)
+        matches!(self.status, AppStatus::Running | AppStatus::Stopping)
+    }
+
+    fn start_api_test(&self) {
+        if self.api_testing.load(Ordering::SeqCst) {
+            return;
+        }
+        self.api_testing.store(true, Ordering::SeqCst);
+        *self.api_test_result.lock().unwrap() = None;
+
+        let translator = match self.config.translation_engine {
+            TranslationEngine::DeepL => Translator::new_deepl(self.config.deepl_api_key.clone()),
+            TranslationEngine::LocalLLM => Translator::new_local(
+                self.config.local_llm_endpoint.clone(),
+                self.config.local_llm_model.clone(),
+            ),
+            TranslationEngine::Groq => Translator::new_groq(
+                self.config.groq_api_key.clone(),
+                self.config.groq_model.clone(),
+            ),
+        };
+
+        let source = self.config.source_lang.clone();
+        let target = self.config.target_lang.clone();
+        let result = self.api_test_result.clone();
+        let testing = self.api_testing.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let start = std::time::Instant::now();
+            let res = rt.block_on(translator.translate_batch(
+                vec!["Hello".to_string()],
+                &source,
+                &target,
+            ));
+            let elapsed = start.elapsed();
+
+            let msg = match res {
+                Ok(translations) => {
+                    let translated = translations.first()
+                        .and_then(|t| t.clone())
+                        .unwrap_or_else(|| "(empty)".to_string());
+                    format!("OK: \"{}\" ({:.0}ms)", translated, elapsed.as_millis())
+                }
+                Err(e) => format!("NG: {}", e),
+            };
+
+            *result.lock().unwrap() = Some(msg);
+            testing.store(false, Ordering::SeqCst);
+        });
     }
 }
 
 impl eframe::App for GameTranslatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll overlay thread completion without blocking
+        if matches!(self.status, AppStatus::Stopping) {
+            self.poll_thread_completion();
+            ctx.request_repaint();
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Game Translator");
             ui.separator();
@@ -207,6 +284,11 @@ impl eframe::App for GameTranslatorApp {
                         TranslationEngine::LocalLLM,
                         "Local LLM",
                     );
+                    ui.radio_value(
+                        &mut self.config.translation_engine,
+                        TranslationEngine::Groq,
+                        "Groq",
+                    );
                 });
 
                 match self.config.translation_engine {
@@ -230,6 +312,20 @@ impl eframe::App for GameTranslatorApp {
                             ui.text_edit_singleline(&mut self.config.local_llm_model);
                         });
                     }
+                    TranslationEngine::Groq => {
+                        ui.horizontal(|ui| {
+                            ui.label("APIキー:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.groq_api_key)
+                                    .password(true)
+                                    .desired_width(300.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("モデル:");
+                            ui.text_edit_singleline(&mut self.config.groq_model);
+                        });
+                    }
                 }
 
                 ui.horizontal(|ui| {
@@ -237,6 +333,24 @@ impl eframe::App for GameTranslatorApp {
                     ui.text_edit_singleline(&mut self.config.source_lang);
                     ui.label("ターゲット言語:");
                     ui.text_edit_singleline(&mut self.config.target_lang);
+                });
+
+                ui.horizontal(|ui| {
+                    let testing = self.api_testing.load(Ordering::SeqCst);
+                    if testing {
+                        ui.add_enabled(false, egui::Button::new("テスト中..."));
+                        ui.ctx().request_repaint();
+                    } else if ui.button("接続テスト").clicked() {
+                        self.start_api_test();
+                    }
+
+                    if let Some(msg) = self.api_test_result.lock().unwrap().as_ref() {
+                        if msg.starts_with("OK") {
+                            ui.colored_label(egui::Color32::GREEN, msg);
+                        } else {
+                            ui.colored_label(egui::Color32::RED, msg);
+                        }
+                    }
                 });
             });
 
@@ -257,21 +371,32 @@ impl eframe::App for GameTranslatorApp {
 
             // === Controls ===
             ui.horizontal(|ui| {
-                let running = self.is_running();
-                if !running {
-                    if ui
-                        .add_sized([120.0, 30.0], egui::Button::new("開始"))
-                        .clicked()
-                    {
-                        self.start();
+                match &self.status {
+                    AppStatus::Idle | AppStatus::Error(_) => {
+                        if ui
+                            .add_sized([120.0, 30.0], egui::Button::new("開始"))
+                            .clicked()
+                        {
+                            self.start();
+                        }
                     }
-                } else {
-                    if ui
-                        .add_sized([120.0, 30.0], egui::Button::new("停止"))
-                        .clicked()
-                    {
-                        self.stop();
+                    AppStatus::Running => {
+                        if ui
+                            .add_sized([120.0, 30.0], egui::Button::new("停止"))
+                            .clicked()
+                        {
+                            self.stop();
+                        }
                     }
+                    AppStatus::Stopping => {
+                        ui.add_enabled(false, egui::Button::new("停止中...").min_size(egui::vec2(120.0, 30.0)));
+                    }
+                }
+
+                ui.add_space(16.0);
+
+                if ui.checkbox(&mut self.debug_log, "Debug Log").changed() {
+                    crate::config::set_debug_log(self.debug_log);
                 }
 
                 ui.add_space(16.0);
@@ -282,6 +407,9 @@ impl eframe::App for GameTranslatorApp {
                     }
                     AppStatus::Running => {
                         ui.colored_label(egui::Color32::GREEN, "実行中");
+                    }
+                    AppStatus::Stopping => {
+                        ui.colored_label(egui::Color32::YELLOW, "停止中...");
                     }
                     AppStatus::Error(msg) => {
                         ui.colored_label(egui::Color32::RED, msg.as_str());
@@ -294,6 +422,10 @@ impl eframe::App for GameTranslatorApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.is_running() {
             self.stop();
+            // Block on exit to ensure clean shutdown
+            if let Some(handle) = self.overlay_thread.take() {
+                let _ = handle.join();
+            }
         }
     }
 }

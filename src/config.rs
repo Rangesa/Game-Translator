@@ -1,11 +1,23 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DEBUG_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_debug_log(enabled: bool) {
+    DEBUG_LOG_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+pub fn is_debug_log() -> bool {
+    DEBUG_LOG_ENABLED.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum TranslationEngine {
     DeepL,
     LocalLLM,
+    Groq,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +26,8 @@ pub struct AppConfig {
     pub deepl_api_key: String,
     pub local_llm_endpoint: String,
     pub local_llm_model: String,
+    pub groq_api_key: String,
+    pub groq_model: String,
     pub source_lang: String,
     pub target_lang: String,
     pub overlay_text_color: [f32; 4],
@@ -27,6 +41,8 @@ impl Default for AppConfig {
             deepl_api_key: String::new(),
             local_llm_endpoint: "http://localhost:5000".to_string(),
             local_llm_model: "default".to_string(),
+            groq_api_key: String::new(),
+            groq_model: "llama-3.3-70b-versatile".to_string(),
             source_lang: "EN".to_string(),
             target_lang: "JA".to_string(),
             overlay_text_color: [1.0, 1.0, 0.0, 1.0], // Yellow

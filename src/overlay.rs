@@ -10,6 +10,27 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 use std::mem;
 
+/// RAII guard that ensures ReleaseDC is called for a screen DC obtained via GetDC(None).
+struct ScreenDcGuard(HDC);
+
+impl ScreenDcGuard {
+    fn acquire() -> anyhow::Result<Self> {
+        let dc = unsafe { GetDC(None) };
+        if dc.is_invalid() {
+            anyhow::bail!("GetDC(None) failed");
+        }
+        Ok(Self(dc))
+    }
+}
+
+impl Drop for ScreenDcGuard {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseDC(None, self.0);
+        }
+    }
+}
+
 pub struct TranslatedText {
     pub translated_text: String,
     pub x: f32,
@@ -258,7 +279,7 @@ impl Overlay {
                 let is_recreate = e.downcast_ref::<windows::core::Error>()
                     .is_some_and(|we| we.code() == HRESULT(0x8899000Cu32 as i32));
                 if is_recreate {
-                    eprintln!("[D2D] Render target lost, recreating...");
+                    crate::log_always("[D2D] Render target lost, recreating...");
                     self.recreate_render_resources()?;
                     self.render_inner(texts, hwnd)
                 } else {
@@ -372,13 +393,10 @@ impl Overlay {
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
 
-            let screen_dc = GetDC(None);
-            if screen_dc.is_invalid() {
-                anyhow::bail!("GetDC failed in render");
-            }
+            let screen_dc = ScreenDcGuard::acquire()?;
             UpdateLayeredWindow(
                 hwnd,
-                Some(screen_dc),
+                Some(screen_dc.0),
                 Some(&window_pos),
                 Some(&window_size),
                 Some(self.memory_dc),
@@ -387,7 +405,6 @@ impl Overlay {
                 Some(&blend),
                 ULW_ALPHA,
             )?;
-            ReleaseDC(None, screen_dc);
 
             Ok(())
         }
@@ -404,7 +421,7 @@ impl Overlay {
                 let is_recreate = e.downcast_ref::<windows::core::Error>()
                     .is_some_and(|we| we.code() == HRESULT(0x8899000Cu32 as i32));
                 if is_recreate {
-                    eprintln!("[D2D] Render target lost in clear, recreating...");
+                    crate::log_always("[D2D] Render target lost in clear, recreating...");
                     self.recreate_render_resources()?;
                     self.clear_inner(hwnd)
                 } else {
@@ -448,13 +465,10 @@ impl Overlay {
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
 
-            let screen_dc = GetDC(None);
-            if screen_dc.is_invalid() {
-                anyhow::bail!("GetDC failed in clear");
-            }
+            let screen_dc = ScreenDcGuard::acquire()?;
             UpdateLayeredWindow(
                 hwnd,
-                Some(screen_dc),
+                Some(screen_dc.0),
                 Some(&window_pos),
                 Some(&window_size),
                 Some(self.memory_dc),
@@ -463,7 +477,6 @@ impl Overlay {
                 Some(&blend),
                 ULW_ALPHA,
             )?;
-            ReleaseDC(None, screen_dc);
 
             Ok(())
         }
